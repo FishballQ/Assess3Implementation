@@ -1,0 +1,322 @@
+#pragma kernel ComputeGaussianRandom
+#pragma kernel CreateHeightSpectrum
+#pragma kernel CreateDisplaceSpectrum
+#pragma kernel FFTHorizontal
+#pragma kernel FFTHorizontalEnd
+#pragma kernel FFTVertical
+#pragma kernel FFTVerticalEnd
+#pragma kernel TextureGenerationDisplace
+#pragma kernel TextureGenerationNormalBubbles
+
+#define PI 3.14159274f
+#define G 9.81f
+
+// data structure
+RWTexture2D<float4> GaussianRandomRT;		//gaussian random texture
+RWTexture2D<float4> HeightSpectrumRT;		//hight spectrum texture
+RWTexture2D<float4> DisplaceXSpectrumRT;	//offset X texture
+RWTexture2D<float4> DisplaceZSpectrumRT;	//offset Z texture
+RWTexture2D<float4> InputRT;				//input
+RWTexture2D<float4> OutputRT;				//output
+RWTexture2D<float4> NormalRT;				//normal texture
+RWTexture2D<float4> BubblesRT;				//bubbles texture
+RWTexture2D<float4> DisplaceRT;				//offset texture
+
+// random seed
+uint wang_hash(uint seed)
+{
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+
+uint rngState;           // random numbers
+
+// computer random numbers in [0,1) 
+float rand_xorshift()
+{
+    // Xorshift algorithm from George Marsaglia's paper
+    rngState ^= (rngState << 13);
+    rngState ^= (rngState >> 17);
+    rngState ^= (rngState << 5);
+    return rngState / 4294967296.0f;;
+}
+
+// FFT texture size, equals to ocean mesh size
+int N;
+
+// compute Gaussian random numbers
+float2 gaussian(float2 id)
+{
+    // get random numbers
+    rngState = wang_hash(id.y * N + id.x);
+    float x1 = rand_xorshift();
+    float x2 = rand_xorshift();
+    x1 = max(1e-6f, x1);
+    x2 = max(1e-6f, x2);
+    
+    // transform 2 independent Gaussian random numbers using Box-Muller
+    float g1 = sqrt(-2.0f * log(x1)) * cos(2.0f * PI * x2);
+    float g2 = sqrt(-2.0f * log(x1)) * sin(2.0f * PI * x2);
+
+    return float2(g1, g2);
+}
+
+// calculate Gaussian random variables
+[numthreads(8, 8, 1)]
+void ComputeGaussianRandom(uint3 id: SV_DispatchThreadID)
+{
+    float2 g = gaussian(id.xy);
+    GaussianRandomRT[id.xy] = float4(g, 0, 0);
+}
+
+// parameters for phillips spectrum
+float Amplitude;   // amplitude
+float2 Wind;       // wind speed	
+//float kLength;     // wave length
+
+// compute phillips spectrum
+float phillips(float2 k)
+{
+    // k = (k_x, k_z), k_x = 2\pi n / Lx, k_y = 2\pi m / Lz
+    float kLength = length(k);
+    kLength = max(0.001f, kLength);
+    float kLength2 = kLength * kLength;
+    float kLength4 = kLength2 * kLength2;
+    // L = V^2 / g
+    float windLength = length(Wind);
+    float l = windLength * windLength / G;
+    float l2 = l * l;
+    float damping = 0.001f;
+    float L2 = l2 * damping * damping;
+    // phillips spectrum equation
+    return Amplitude * exp(-1.0f / (kLength2 * l2)) / kLength4 * exp(-kLength2 * L2);
+}
+
+// w^2 = gk
+float dispersion(float2 k)
+{
+    return sqrt(G * length(k));
+}
+
+// Donelan-Banner extension
+float DonelanBannerDirectionalSpreading(float2 k)
+{
+    // w_p = 0.855g / U
+    float omegap = 0.855f * G / length(Wind.xy);
+    // w / w_p
+    float ratio = dispersion(k) / omegap;
+    // betaS
+    float betaS;
+    if (ratio < 0.95f)
+    {
+        betaS = 2.61f * pow(ratio, 1.3f);
+    }
+    if(ratio >= 0.95f && ratio < 1.6f)
+    {
+        betaS = 2.28f * pow(ratio, -1.3f);
+    }
+    if(ratio >= 1.6f)
+    {
+        float epsilon = -0.4f + 0.8393f * exp(-0.567f * log(ratio * ratio));
+        betaS = pow(10, epsilon);
+    }
+    // theta = arctan(k_y, k_x) - arctan(wind_y, wind_x)
+    float theta = atan2(k.y, k.x) - atan2(Wind.y, Wind.x);
+    // D(w, theta) = betaS / 2 tanh(betaS * \pi) sech(\betaS \theta)^2
+    return betaS / max(1e-7f, 2.0f * tanh(betaS * PI) * pow(cosh(betaS * theta), 2));
+}
+
+// calculate complex numbers
+float2 complexMultiply(float2 c1, float2 c2)
+{
+    return float2(c1.x * c2.x - c1.y * c2.y, c1.x * c2.y + c1.y * c2.x);
+}
+
+float Time;				
+
+// compute hight spectrum
+[numthreads(8, 8, 1)]
+void CreateHeightSpectrum(uint3 id: SV_DispatchThreadID)
+{
+    // (k_x, k_z) = (2\pi n' / Lx, 2\pi m' / Lz)
+    float2 k = float2(2.0f * PI * id.x / N - PI, 2.0f * PI * id.y / N - PI);
+    // get gaussian random numbers
+    float2 gaussian = GaussianRandomRT[id.xy].xy;
+    // h0
+    float2 hTilde0 = gaussian * sqrt(abs(phillips(k) * DonelanBannerDirectionalSpreading(k)) / 2.0f);
+    float2 hTilde0Conj = gaussian * sqrt(abs(phillips(-k) * DonelanBannerDirectionalSpreading(-k)) / 2.0f);
+    hTilde0Conj.y *= -1.0f;
+    // Euler's equation: e^{ix} = cosx + isinx
+    float omegat = dispersion(k) * Time;
+    float c = cos(omegat);
+    float s = sin(omegat);
+    float2 h1 = complexMultiply(hTilde0, float2(c, s));
+    float2 h2 = complexMultiply(hTilde0Conj, float2(c, -s));
+    // h
+    float2 HTilde = h1 + h2;
+    // generate hight texture
+    HeightSpectrumRT[id.xy] = float4(HTilde, 0, 0);
+}
+
+// Ns = pow(2, m - 1)
+int Ns;
+
+// horizontal FFT (m - 1) 
+[numthreads(8, 8, 1)]
+void FFTHorizontal(uint3 id: SV_DispatchThreadID)
+{
+    // Stockham input index, floor(x / 2^m) * 2^{m - 1} + x mod 2^{m - 1}
+    int2 idxs = id.xy;
+    idxs.x = floor(id.x / (Ns * 2.0f)) * Ns + id.x % Ns;
+    // calculate weight, W_N^u = e^{i 2\pi u / N}
+    float angle = 2.0f * PI * (id.x / (Ns * 2.0f));
+    float2 w = float2(cos(angle), sin(angle));
+    // get input height sepctrum 
+    float2 x0 = InputRT[idxs].xy;
+    float2 x1 = InputRT[int2(idxs.x + N * 0.5f, idxs.y)].xy;
+    // output = x0 + w x1
+    float2 output  = x0 + complexMultiply(w, x1);
+    OutputRT[id.xy] = float4(output, 0, 0);
+}
+
+// compute horizontal FFT (m)
+[numthreads(8, 8, 1)]
+void FFTHorizontalEnd(uint3 id: SV_DispatchThreadID)
+{
+    // Stockham compute input index, left is: floor(x / 2^m) * 2^{m - 1} + x mod 2^{m - 1}
+    int2 idxs = id.xy;
+    idxs.x = floor(id.x / (Ns * 2.0f)) * Ns + id.x % Ns;
+    // calculate weight: W_N^u = e^{i 2\pi u / N}
+    float angle = 2.0f * PI * (id.x / (Ns * 2.0f));
+    float2 w = float2(cos(angle), sin(angle)) * -1;
+    // get height spectrum that inputed
+    float2 x0 = InputRT[idxs].xy;
+    float2 x1 = InputRT[int2(idxs.x + N * 0.5f, idxs.y)].xy;
+    
+    // output = x0 - w x1
+    float2 output = x0 + complexMultiply(w, x1);
+    int x = id.x - N * 0.5f;
+    output *= (x + 1) % 2.0f - x % 2.0f;
+    OutputRT[id.xy] = float4(output, 0, 0);
+}
+
+// vertical FFT (m-1))
+[numthreads(8, 8, 1)]
+void FFTVertical(uint3 id: SV_DispatchThreadID)
+{
+    // Stockham compute input index, floor(x / 2^m) * 2^{m - 1} + x mod 2^{m - 1}
+    int2 idxs = id.xy;
+    idxs.y = floor(id.y / (Ns * 2.0f)) * Ns + id.y % Ns;
+    // calculate weight: W_N^u = e^{i 2\pi u / N}
+    float angle = 2.0f * PI * (id.y / (Ns * 2.0f));
+    float2 w = float2(cos(angle), sin(angle));
+    // get height spectrum that inputed
+    float2 x0 = InputRT[idxs].xy;
+    float2 x1 = InputRT[int2(idxs.x, idxs.y + N * 0.5f)].xy;
+    // output = x0 + w x1
+    float2 output = x0 + complexMultiply(w, x1);
+    OutputRT[id.xy] = float4(output, 0, 0);
+}
+
+// vertical FFT (m)
+[numthreads(8, 8, 1)]
+void FFTVerticalEnd(uint3 id: SV_DispatchThreadID)
+{
+    // Stockham Stockham compute input index, floor(x / 2^m) * 2^{m - 1} + x mod 2^{m - 1}
+    int2 idxs = id.xy;
+    idxs.y = floor(id.y / (Ns * 2.0f)) * Ns + id.y % Ns;
+    // calculate weight: W_N^u = e^{i 2\pi u / N}
+    float angle = 2.0f * PI * (id.y / (Ns * 2.0f));
+    float2 w = float2(cos(angle), sin(angle)) * -1;
+    // get height spectrum that inputed
+    float2 x0 = InputRT[idxs].xy;
+    float2 x1 = InputRT[int2(idxs.x, idxs.y + N * 0.5f)].xy;
+    // output = x0 - w x1
+    float2 output = x0 + complexMultiply(w, x1);
+    int x = id.y - N * 0.5f;
+    output *= (x + 1) % 2.0f - x % 2.0f;
+    OutputRT[id.xy] = float4(output, 0, 0);
+}
+
+// generate offset spectrum
+[numthreads(8, 8, 1)]
+void CreateDisplaceSpectrum(uint3 id: SV_DispatchThreadID)
+{
+    // k = (k_x, k_y)，k / |k|
+    float2 k = float2(2 * PI * id.x / N - PI, 2 * PI * id.y / N - PI);
+    k /= max(0.001f, length(k));
+    // height
+    float2 HTilde = HeightSpectrumRT[id.xy].xy;
+    // -k_x / |k| * h
+    float2 KxHTilde = complexMultiply(float2(0, -k.x), HTilde);
+    // -k_z / |k| * h
+    float2 kzHTilde = complexMultiply(float2(0, -k.y), HTilde);
+    // D_x, D_z
+    DisplaceXSpectrumRT[id.xy] = float4(KxHTilde, 0, 0);
+    DisplaceZSpectrumRT[id.xy] = float4(kzHTilde, 0, 0);
+}
+
+float Lambda;
+float HeightScale;		
+
+//generate offset texture
+[numthreads(8, 8, 1)]
+void TextureGenerationDisplace(uint3 id: SV_DispatchThreadID)
+{
+    // get actual offset length / size, and * parameters
+    float y = length(HeightSpectrumRT[id.xy].xy) / (N * N) * HeightScale; // height
+    float x = length(DisplaceXSpectrumRT[id.xy].xy) / (N * N) * Lambda; // x offset
+    float z = length(DisplaceZSpectrumRT[id.xy].xy) / (N * N) * Lambda; // z offset
+    // set texture
+    HeightSpectrumRT[id.xy] = float4(y, y, y, 0);
+    DisplaceXSpectrumRT[id.xy] = float4(x, x, x, 0);
+    DisplaceZSpectrumRT[id.xy] = float4(z, z, z, 0);
+    DisplaceRT[id.xy] = float4(x, y, z, 0);
+}
+
+float OceanLength;  // ocean width
+float BubblesThreshold;
+float BubblesScale;
+
+//generate normal and bubble texture
+[numthreads(8, 8, 1)]
+void TextureGenerationNormalBubbles(uint3 id: SV_DispatchThreadID)
+{
+    // enquire unit length between the 2 points
+    float uintLength = OceanLength / (N - 1.0f);
+    // get uv coordinates of the point and 4 neighbour points 
+    uint2 uvX1 = uint2((id.x - 1.0f + N) % N, id.y);
+    uint2 uvX2 = uint2((id.x + 1.0f + N) % N, id.y);
+    uint2 uvZ1 = uint2(id.x, (id.y - 1.0f + N) % N);
+    uint2 uvZ2 = uint2(id.x, (id.y + 1.0f + N) % N);
+    //get offset values of the 4 neighbour points 
+    float3 x1D = DisplaceRT[uvX1].xyz; // offset of the first point in x-axis 
+    float3 x2D = DisplaceRT[uvX2].xyz; // offset of the sec point in x-axis 
+    float3 z1D = DisplaceRT[uvZ1].xyz; // offset of the first point in z-axis 
+    float3 z2D = DisplaceRT[uvZ2].xyz; // offset of the sec point in z-axis 
+    //generate coordinates of the 4 neighbour points
+    float3 x1 = float3(x1D.x - uintLength, x1D.yz); // first point in x-axis
+    float3 x2 = float3(x2D.x + uintLength, x2D.yz); // second point in x-axis
+    float3 z1 = float3(z1D.xy, z1D.z - uintLength); // first point in z-axis
+    float3 z2 = float3(z1D.xy, z1D.z + uintLength); // second point in z-axis
+
+    float3 tangentX = (x2 - x1) / 2.0f;
+    float3 tangentZ = (z2 - z1) / 2.0f;
+    // get normal from the x,z tangent values
+    float3 normal = normalize(cross(tangentZ, tangentX));
+    
+    //calculate bubbles
+    float3 ddx = x2D - x1D;
+    float3 ddz = z2D - z1D;
+    //Jacobian: J = JxxJzz - JxzJzx
+    float jacobian = (1.0f + ddx.x) * (1.0f + ddz.z) - ddx.z * ddz.x;
+    jacobian = saturate(max(0, BubblesThreshold - saturate(jacobian)) * BubblesScale);
+
+    // set normal texture and bubbles texture
+    NormalRT[id.xy] = float4(normal, 0);
+    BubblesRT[id.xy] = float4(jacobian, jacobian, jacobian, 0);
+}
